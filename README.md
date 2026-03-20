@@ -11,24 +11,41 @@ If your Codex CLI session gets slow, keeps falling back from WebSocket to HTTP, 
 
 This repo was generated with AI assistance. Read the code before installing it.
 
-## Use
+## Install
+
+1. Clone the repo:
+
+```bash
+git clone git@github.com:raunak42/codex-fresh.git
+cd codex-fresh
+```
+
+2. Run the installer:
 
 ```bash
 ./install.sh
-codex fresh
 ```
 
-Or use the standalone command:
+3. Open a new shell, or reload your shell config:
 
 ```bash
-codex-fresh
+source ~/.bashrc
+```
+
+4. Start it:
+
+```bash
+codex fresh
 ```
 
 If you only want the standalone command without the shell hook:
 
 ```bash
 INSTALL_HOOK=0 ./install.sh
+codex-fresh
 ```
+
+## Use
 
 Useful flags:
 
