@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+
+import argparse
+import functools
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional
+
+
+DEFAULT_LIMIT = 20
+IMAGE_MARKER_RE = re.compile(r"</?image(?:\s+[^>]*)?>|\[Image #\d+\]")
+
+
+@dataclass
+class Session:
+    session_id: str
+    path: Path
+    cwd: str
+    created_at: datetime
+    updated_at: datetime
+    branch: str
+    summary: str
+    originator: str
+    source_kind: str
+    agent_role: str
+    agent_nickname: str
+    archived: bool
+
+    @property
+    def resume_visible(self) -> bool:
+        return (
+            self.source_kind == "cli"
+            and not self.agent_role
+            and not self.agent_nickname
+            and not self.archived
+            and self.summary != "(no user message found)"
+        )
+
+
+def codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".codex"
+
+
+def sqlite_home() -> Path:
+    env = os.environ.get("CODEX_SQLITE_HOME")
+    if env:
+        return Path(env).expanduser()
+    return codex_home()
+
+
+def state_db_path() -> Optional[Path]:
+    root = sqlite_home()
+    candidates = sorted(root.glob("state_*.sqlite"))
+    if candidates:
+        return max(candidates, key=lambda item: item.stat().st_mtime)
+    fallback = root / "state.sqlite"
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def parse_timestamp(raw: Optional[str], fallback_ts: float) -> datetime:
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(fallback_ts, tz=timezone.utc)
+
+
+def squash(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def clean_preview_text(text: str) -> str:
+    cleaned = IMAGE_MARKER_RE.sub(" ", text)
+    cleaned = re.sub(r"\s*-\s*([.,!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return squash(cleaned)
+
+
+def normalize_source(source: object) -> str:
+    if isinstance(source, str):
+        return source
+    if isinstance(source, dict):
+        if "subagent" in source:
+            return "subagent"
+        return "object"
+    return ""
+
+
+def extract_user_text(obj: dict) -> str:
+    obj_type = obj.get("type")
+    payload = obj.get("payload", {})
+
+    if obj_type == "event_msg" and payload.get("type") == "user_message":
+        return str(payload.get("message") or payload.get("text") or "")
+
+    if obj_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+        parts = []
+        for item in payload.get("content", []):
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+
+    return ""
+
+
+def looks_like_metadata(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        not stripped
+        or stripped.startswith("<environment_context>")
+        or stripped.startswith("<turn_aborted>")
+        or stripped.startswith("<cwd>")
+        or stripped.startswith("# AGENTS.md instructions for ")
+        or "AGENTS.md instructions for " in stripped[:160]
+    )
+
+
+def preview_from_rollout(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                text = clean_preview_text(extract_user_text(obj))
+                if text and not looks_like_metadata(text):
+                    return text
+    except OSError:
+        pass
+    return ""
+
+
+def derive_summary(first_user_message: str, title: str, rollout_path: Optional[Path]) -> str:
+    for raw in (first_user_message, title):
+        text = clean_preview_text(raw)
+        if text and not looks_like_metadata(text):
+            return text
+
+    if rollout_path is not None:
+        text = preview_from_rollout(rollout_path)
+        if text:
+            return text
+
+    return "(no user message found)"
+
+
+def scan_session(path: Path) -> Optional[Session]:
+    stat = path.stat()
+    created_at = parse_timestamp(None, stat.st_mtime)
+    updated_at = parse_timestamp(None, stat.st_mtime)
+    session_id = ""
+    cwd = ""
+    branch = "-"
+    summary = ""
+    originator = ""
+    source_kind = ""
+    agent_role = ""
+    agent_nickname = ""
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                updated_at = max(updated_at, parse_timestamp(obj.get("timestamp"), stat.st_mtime))
+
+                if obj.get("type") == "session_meta":
+                    payload = obj.get("payload", {})
+                    session_id = str(payload.get("id") or session_id)
+                    cwd = str(payload.get("cwd") or cwd)
+                    branch = str(payload.get("branch") or payload.get("git_branch") or branch)
+                    originator = str(payload.get("originator") or originator)
+                    agent_role = str(payload.get("agent_role") or agent_role)
+                    agent_nickname = str(payload.get("agent_nickname") or agent_nickname)
+                    source = payload.get("source")
+                    if isinstance(source, str):
+                        source_kind = source
+                    elif isinstance(source, dict):
+                        if "subagent" in source:
+                            source_kind = "subagent"
+                        else:
+                            source_kind = "object"
+                    created_at = parse_timestamp(payload.get("timestamp") or obj.get("timestamp"), stat.st_mtime)
+
+                if not summary:
+                    text = clean_preview_text(extract_user_text(obj))
+                    if text and not looks_like_metadata(text):
+                        summary = text
+
+                if session_id and cwd and summary:
+                    break
+    except OSError:
+        return None
+
+    if not session_id:
+        return None
+
+    if not summary:
+        summary = "(no user message found)"
+
+    return Session(
+        session_id=session_id,
+        path=path,
+        cwd=cwd,
+        created_at=created_at,
+        updated_at=updated_at,
+        branch=branch or "-",
+        summary=summary,
+        originator=originator,
+        source_kind=source_kind,
+        agent_role=agent_role,
+        agent_nickname=agent_nickname,
+        archived=False,
+    )
+
+
+def discover_sessions_from_rollouts(root: Path) -> List[Session]:
+    sessions: List[Session] = []
+    for path in root.rglob("rollout-*.jsonl"):
+        session = scan_session(path)
+        if session is not None:
+            sessions.append(session)
+    sessions.sort(key=lambda item: item.updated_at, reverse=True)
+    return sessions
+
+
+def discover_sessions_from_db(db_path: Path) -> List[Session]:
+    sessions: List[Session] = []
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return sessions
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                rollout_path,
+                created_at,
+                updated_at,
+                source,
+                cwd,
+                title,
+                git_branch,
+                first_user_message,
+                agent_role,
+                agent_nickname,
+                archived
+            FROM threads
+            ORDER BY updated_at DESC
+            """
+        )
+        for row in rows:
+            rollout_path = Path(row["rollout_path"]).expanduser() if row["rollout_path"] else None
+            sessions.append(
+                Session(
+                    session_id=row["id"],
+                    path=rollout_path or Path(),
+                    cwd=row["cwd"] or "",
+                    created_at=datetime.fromtimestamp(int(row["created_at"]), tz=timezone.utc),
+                    updated_at=datetime.fromtimestamp(int(row["updated_at"]), tz=timezone.utc),
+                    branch=row["git_branch"] or "-",
+                    summary=derive_summary(
+                        row["first_user_message"] or "",
+                        row["title"] or "",
+                        rollout_path,
+                    ),
+                    source_kind=normalize_source(row["source"]),
+                    originator="",
+                    agent_role=row["agent_role"] or "",
+                    agent_nickname=row["agent_nickname"] or "",
+                    archived=bool(row["archived"]),
+                )
+            )
+    except sqlite3.Error:
+        sessions = []
+    finally:
+        conn.close()
+
+    return sessions
+
+
+def discover_sessions(root: Path) -> List[Session]:
+    db_path = state_db_path()
+    if db_path is not None:
+        sessions = discover_sessions_from_db(db_path)
+        if sessions:
+            return sessions
+    return discover_sessions_from_rollouts(root)
+
+
+@functools.lru_cache(maxsize=None)
+def scope_root(path: str) -> str:
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return path
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", real, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return real
+
+    root = proc.stdout.strip()
+    return os.path.realpath(root) if root else real
+
+
+def truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def human_age(moment: datetime, now: datetime) -> str:
+    seconds = max(int((now - moment.astimezone(now.tzinfo)).total_seconds()), 0)
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    if days < 365:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    years = days // 365
+    return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+def pick_with_fzf(sessions: List[Session]) -> Optional[Session]:
+    import subprocess
+
+    now = datetime.now().astimezone()
+    rows = ["ID\tUpdated at\tCreated at\tBranch\tConversation\tCWD"]
+    for session in sessions:
+        rows.append(
+            "\t".join(
+                [
+                    session.session_id,
+                    human_age(session.updated_at, now),
+                    human_age(session.created_at, now),
+                    session.branch,
+                    truncate(session.summary, 120),
+                    truncate(session.cwd, 80),
+                ]
+            )
+        )
+
+    proc = subprocess.run(
+        [
+            "fzf",
+            "--delimiter=\t",
+            "--with-nth=2,3,4,5,6",
+            "--header-lines=1",
+            "--layout=reverse",
+            "--height=80%",
+            "--prompt=codex fresh> ",
+        ],
+        input="\n".join(rows),
+        text=True,
+        capture_output=True,
+    )
+
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+
+    selected_id = proc.stdout.split("\t", 1)[0].strip()
+    for session in sessions:
+        if session.session_id == selected_id:
+            return session
+    return None
+
+
+def render_list(sessions: List[Session], limit: int) -> None:
+    now = datetime.now().astimezone()
+    print("Resume a previous session  Sort: Updated at")
+    print("Type to search")
+    print("  Created at      Updated at      Branch  Conversation")
+    shown = sessions[:limit]
+    for index, session in enumerate(shown, start=1):
+        marker = ">" if index == 1 else " "
+        created = truncate(human_age(session.created_at, now), 14)
+        updated = truncate(human_age(session.updated_at, now), 14)
+        branch = truncate(session.branch, 6)
+        summary = truncate(session.summary, 92)
+        print(f"{marker} {index:>2}. {created:<14}  {updated:<14}  {branch:<6}  {summary}")
+    if len(sessions) > limit:
+        print(f"\nShowing {limit} of {len(sessions)} matches.")
+    print()
+
+
+def pick_with_prompt(sessions: List[Session], limit: int) -> Optional[Session]:
+    filtered = sessions
+    while True:
+        render_list(filtered, limit)
+        answer = input("Select number, type text to filter, Enter to reset, or q to quit: ").strip()
+
+        if not answer:
+            filtered = sessions
+            continue
+
+        if answer.lower() in {"q", "quit", "exit"}:
+            return None
+
+        if answer.isdigit():
+            index = int(answer)
+            visible = min(limit, len(filtered))
+            if 1 <= index <= visible:
+                return filtered[index - 1]
+            print("Selection out of range.\n")
+            continue
+
+        needle = answer.lower()
+        filtered = [
+            session
+            for session in sessions
+            if needle in session.summary.lower()
+            or needle in session.cwd.lower()
+            or needle in session.session_id.lower()
+        ]
+        if not filtered:
+            print("No matches.\n")
+            filtered = sessions
+
+
+def choose_session(sessions: List[Session], limit: int) -> Optional[Session]:
+    if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
+        return pick_with_fzf(sessions)
+    return pick_with_prompt(sessions, limit)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Pick a saved Codex session and start a fresh Codex process from it."
+    )
+    parser.add_argument("--all", action="store_true", help="Show sessions from all working directories.")
+    parser.add_argument(
+        "--cwd",
+        default=os.getcwd(),
+        help="Working directory to match when --all is not set. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--root",
+        default=str(codex_home() / "sessions"),
+        help="Session archive root. Defaults to $CODEX_HOME/sessions or ~/.codex/sessions.",
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default=os.environ.get("CODEX_FRESH_CODEX_BIN", "codex"),
+        help="Codex executable to run. Defaults to 'codex'.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Use 'codex resume <id>' instead of 'codex fork <id>'.",
+    )
+    parser.add_argument(
+        "--print",
+        action="store_true",
+        help="Print the resolved command instead of executing it.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"Maximum rows to show at once in the built-in picker. Defaults to {DEFAULT_LIMIT}.",
+    )
+    parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Include rollout files that `/resume` normally hides, such as `codex_exec` and subagent sessions.",
+    )
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser()
+    if not root.exists():
+        print(f"Codex sessions directory not found: {root}", file=sys.stderr)
+        return 1
+
+    sessions = discover_sessions(root)
+    if not args.all:
+        current_scope = scope_root(args.cwd)
+        sessions = [session for session in sessions if scope_root(session.cwd) == current_scope]
+
+    if not args.include_hidden:
+        sessions = [session for session in sessions if session.resume_visible]
+
+    if not sessions:
+        if args.all:
+            print("No saved visible Codex sessions found.", file=sys.stderr)
+        else:
+            print(f"No saved visible Codex sessions found for {scope_root(args.cwd)}.", file=sys.stderr)
+        return 1
+
+    chosen = choose_session(sessions, max(1, args.limit))
+    if chosen is None:
+        return 1
+
+    verb = "resume" if args.resume else "fork"
+    cmd = [args.codex_bin, verb, chosen.session_id]
+
+    if args.print:
+        print(shlex.join(cmd))
+        return 0
+
+    if chosen.cwd and os.path.isdir(chosen.cwd):
+        os.chdir(chosen.cwd)
+
+    try:
+        os.execvp(args.codex_bin, cmd)
+    except FileNotFoundError:
+        print(f"Could not find Codex executable: {args.codex_bin}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
