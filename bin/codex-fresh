@@ -349,6 +349,13 @@ def truncate(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
+def terminal_columns(default: int = 100) -> int:
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except OSError:
+        return default
+
+
 def human_age(moment: datetime, now: datetime) -> str:
     seconds = max(int((now - moment.astimezone(now.tzinfo)).total_seconds()), 0)
     if seconds < 60:
@@ -411,24 +418,46 @@ def pick_with_fzf(sessions: List[Session]) -> Optional[Session]:
 
 
 def render_list(sessions: List[Session], limit: int) -> None:
+    print("\n".join(render_list_lines(sessions, limit)))
+
+
+def render_list_lines(sessions: List[Session], limit: int, selected_index: int = 0) -> List[str]:
     now = datetime.now().astimezone()
-    print("Resume a previous session  Sort: Updated at")
-    print("Type to search")
-    print("  Created at      Updated at      Branch  Conversation")
+    lines = [
+        "Resume a previous session  Sort: Updated at",
+        "Type to search",
+        "  Created at      Updated at      Branch  Conversation",
+    ]
     shown = sessions[:limit]
+    line_prefix = f"> {limit:>2}. {'x' * 14}  {'x' * 14}  {'x' * 6}  "
+    summary_width = max(10, terminal_columns() - len(line_prefix))
+    if shown:
+        selected_index = max(0, min(selected_index, len(shown) - 1))
     for index, session in enumerate(shown, start=1):
-        marker = ">" if index == 1 else " "
+        marker = ">" if index - 1 == selected_index else " "
         created = truncate(human_age(session.created_at, now), 14)
         updated = truncate(human_age(session.updated_at, now), 14)
         branch = truncate(session.branch, 6)
-        summary = truncate(session.summary, 92)
-        print(f"{marker} {index:>2}. {created:<14}  {updated:<14}  {branch:<6}  {summary}")
+        summary = truncate(session.summary, summary_width)
+        lines.append(f"{marker} {index:>2}. {created:<14}  {updated:<14}  {branch:<6}  {summary}")
     if len(sessions) > limit:
-        print(f"\nShowing {limit} of {len(sessions)} matches.")
-    print()
+        lines.extend(["", f"Showing {limit} of {len(sessions)} matches."])
+    lines.append("")
+    return lines
 
 
-def pick_with_prompt(sessions: List[Session], limit: int) -> Optional[Session]:
+def filter_sessions(sessions: List[Session], needle: str) -> List[Session]:
+    lowered = needle.lower()
+    return [
+        session
+        for session in sessions
+        if lowered in session.summary.lower()
+        or lowered in session.cwd.lower()
+        or lowered in session.session_id.lower()
+    ]
+
+
+def pick_with_prompt_basic(sessions: List[Session], limit: int) -> Optional[Session]:
     filtered = sessions
     while True:
         render_list(filtered, limit)
@@ -449,17 +478,158 @@ def pick_with_prompt(sessions: List[Session], limit: int) -> Optional[Session]:
             print("Selection out of range.\n")
             continue
 
-        needle = answer.lower()
-        filtered = [
-            session
-            for session in sessions
-            if needle in session.summary.lower()
-            or needle in session.cwd.lower()
-            or needle in session.session_id.lower()
-        ]
+        filtered = filter_sessions(sessions, answer)
         if not filtered:
             print("No matches.\n")
             filtered = sessions
+
+
+def pick_with_prompt_tty(sessions: List[Session], limit: int) -> Optional[Session]:
+    import select
+    import signal
+    import termios
+    import tty
+
+    filtered = sessions
+    selected_index = 0
+    query = ""
+    error = ""
+    needs_redraw = True
+    resized = False
+    fd = sys.stdin.fileno()
+    original_term = termios.tcgetattr(fd)
+    original_handler = signal.getsignal(signal.SIGWINCH)
+
+    def on_winch(_signum, _frame) -> None:
+        nonlocal resized
+        resized = True
+
+    def redraw() -> None:
+        prompt = f"Use arrows to move, type text to filter, Enter to select, Esc to reset, q to quit: {query}"
+        prompt_width = max(20, terminal_columns())
+        lines = render_list_lines(filtered, limit, selected_index)
+        if error:
+            lines.append(error)
+            lines.append("")
+        lines.append(truncate(prompt, prompt_width))
+        sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(lines))
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        signal.signal(signal.SIGWINCH, on_winch)
+
+        while True:
+            if needs_redraw or resized:
+                redraw()
+                needs_redraw = False
+                resized = False
+
+            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if not ready:
+                continue
+
+            chunk = os.read(fd, 32).decode(errors="ignore")
+            if not chunk:
+                return None
+
+            visible = min(limit, len(filtered))
+            if visible and selected_index >= visible:
+                selected_index = visible - 1
+
+            chunk_pos = 0
+            while chunk_pos < len(chunk):
+                if chunk[chunk_pos : chunk_pos + 3] == "\x1b[A":
+                    if visible:
+                        selected_index = max(0, selected_index - 1)
+                        error = ""
+                        needs_redraw = True
+                    chunk_pos += 3
+                    continue
+
+                if chunk[chunk_pos : chunk_pos + 3] == "\x1b[B":
+                    if visible:
+                        selected_index = min(visible - 1, selected_index + 1)
+                        error = ""
+                        needs_redraw = True
+                    chunk_pos += 3
+                    continue
+
+                ch = chunk[chunk_pos]
+                if ch in ("\r", "\n"):
+                    answer = query.strip()
+                    query = ""
+
+                    if not answer:
+                        if visible:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            return filtered[selected_index]
+                        error = "No matches."
+                    elif answer.lower() in {"q", "quit", "exit"}:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        return None
+                    elif answer.isdigit():
+                        selected_number = int(answer)
+                        visible = min(limit, len(filtered))
+                        if 1 <= selected_number <= visible:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            return filtered[selected_number - 1]
+                        error = "Selection out of range."
+                    else:
+                        next_filtered = filter_sessions(sessions, answer)
+                        if next_filtered:
+                            filtered = next_filtered
+                            selected_index = 0
+                            error = ""
+                        else:
+                            filtered = sessions
+                            selected_index = 0
+                            error = "No matches."
+
+                    needs_redraw = True
+                    chunk_pos += 1
+                    continue
+
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+
+                if ch == "\x1b":
+                    filtered = sessions
+                    selected_index = 0
+                    query = ""
+                    error = ""
+                    needs_redraw = True
+                    chunk_pos += 1
+                    continue
+
+                if ch in ("\x7f", "\b"):
+                    query = query[:-1]
+                    needs_redraw = True
+                    chunk_pos += 1
+                    continue
+
+                if ch == "\x15":
+                    query = ""
+                    needs_redraw = True
+                    chunk_pos += 1
+                    continue
+
+                if ch.isprintable():
+                    query += ch
+                    needs_redraw = True
+                chunk_pos += 1
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original_term)
+        signal.signal(signal.SIGWINCH, original_handler)
+
+
+def pick_with_prompt(sessions: List[Session], limit: int) -> Optional[Session]:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return pick_with_prompt_tty(sessions, limit)
+    return pick_with_prompt_basic(sessions, limit)
 
 
 def choose_session(sessions: List[Session], limit: int) -> Optional[Session]:
