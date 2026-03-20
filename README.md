@@ -7,6 +7,8 @@ The fresh connection is established so you can continue without depending on the
 
 If your Codex CLI session gets slow, keeps falling back from WebSocket to HTTP, or a new chat session feels fast while the original chat is not, this tool is for that case.
 
+It shows a session picker interface similar to `/resume`, then starts the selected chat in a fresh session.
+
 ## AI disclaimer
 
 This repo was generated with AI assistance. Read the code before installing it.
@@ -71,7 +73,7 @@ codex-fresh --print
 
 ## How it works
 
-`codex-fresh` reads Codex's local thread index, shows a picker similar to `/resume`, then runs:
+`codex-fresh` reads Codex's local thread index, shows an interface similar to `/resume`, then runs:
 
 ```bash
 codex fork <session-id>
